@@ -1,0 +1,31 @@
+{
+  "Records": [
+    {
+      "eventID": "2",
+      "eventName": "INSERT",
+      "eventVersion": "1.1",
+      "eventSource": "aws:dynamodb",
+      "awsRegion": "eu-central-1",
+      "dynamodb": {
+        "ApproximateCreationDateTime": 1751630400,
+        "Keys": {
+          "device_id": { "S": "incubator-01" },
+          "timestamp": { "N": "1751630400" }
+        },
+        "NewImage": {
+          "device_id": { "S": "incubator-01" },
+          "timestamp": { "N": "1751630400" },
+          "temperature_celsius": { "N": "999" },
+          "humidity_rh": { "N": "150" },
+          "co2_ppm": { "N": "820" },
+          "voltage": { "N": "12.1" },
+          "relay_state": { "N": "5" }
+        },
+        "SequenceNumber": "111000000000000000002",
+        "SizeBytes": 300,
+        "StreamViewType": "NEW_IMAGE"
+      },
+      "eventSourceARN": "arn:aws:dynamodb:eu-central-1:123456789012:table/incubator_measurement_raw/stream/2026-07-04T12:00:00.000"
+    }
+  ]
+}
