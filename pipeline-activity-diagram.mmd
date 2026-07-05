@@ -1,0 +1,42 @@
+flowchart TD
+    Start([Sensor device writes measurement]) --> RawTable[(incubator_measurement_raw)]
+    RawTable -- DynamoDB Stream: INSERT --> Cleanup[lambda-cleanup-measurements]
+
+    Cleanup --> Validate{All fields valid?}
+    Validate -- yes --> CleanTable[(incubator_measurement_clean)]
+    Validate -- no --> RejectedTable[(incubator_measurement_rejected)]
+
+    RejectedTable --> EndRejected([Stored for debugging, no further action])
+
+    CleanTable -- DynamoDB Stream: INSERT/MODIFY --> AlertLambda[incubator-threshold-alert]
+
+    AlertLambda --> HasSettings{Settings exist\nfor device_id?}
+    HasSettings -- no --> EndNoSettings([Skip - no thresholds to check])
+    HasSettings -- yes --> CheckThresholds[Compare each measurement field\nagainst configured min/max]
+
+    CheckThresholds --> AnyViolation{Any field\nout of range?}
+    AnyViolation -- no --> EndOk([No alert])
+    AnyViolation -- yes --> WriteAlert[(incubator_alerts)]
+    AnyViolation -- yes --> PublishSns[[SNS: incubator-measurement-\noutside-allowed-range]]
+
+    PublishSns --> Subscribers([Email / SMS subscribers notified])
+
+    subgraph Settings Management
+        direction TB
+        PostReq([HTTP POST /settings]) --> PostLambda[incubator-settings-post]
+        PostLambda --> SettingsTable[(incubator_settings)]
+        GetReq([HTTP GET /settings/device_id]) --> GetLambda[incubator-settings-get]
+        SettingsTable --> GetLambda
+        GetLambda -- found --> GetResponse([Return stored settings])
+        GetLambda -- not found --> DefaultResponse([Return default settings])
+    end
+
+    SettingsTable -. read by .-> HasSettings
+
+    subgraph Latest Reading
+        direction TB
+        LatestReq([HTTP GET /latest or /latest/device_id]) --> LatestLambda[incubator-latest-reading]
+        LatestLambda --> LatestResponse([Return most recent measurement])
+    end
+
+    CleanTable -. read by .-> LatestLambda

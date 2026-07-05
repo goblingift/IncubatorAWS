@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(ls -la \"C:/development/git/IncubatorConsole\")",
+      "Read(//c/development/git/IncubatorConsole/**)",
+      "Read(//c/development/git/IncubatorConsole/esp32-incubator-platformio/**)",
+      "Read(//c/development/git/IncubatorConsole/esp32-gateway-platformio/**)",
+      "Read(//c/development/git/IncubatorConsole/esp32-incubator-platformio/src/**)",
+      "Read(//c/development/git/IncubatorConsole/esp32-gateway-platformio/src/**)",
+      "Read(//c/development/git/IncubatorConsole/incubator-react/**)",
+      "Bash(find \"C:/development/git/IncubatorConsole/esp32-incubator-platformio/.pio/libdeps\" -maxdepth 1 -iname \"*relay*\")",
+      "Read(//c/development/git/IncubatorConsole/esp32-incubator-platformio/.pio/libdeps/**)",
+      "Bash(pio --version)",
+      "PowerShell(Get-Command python, python3, py -ErrorAction SilentlyContinue)",
+      "Bash(ls -la \"/c/development/git/IncubatorConsole/esp32-gateway-platformio/src/\" | grep -i config)",
+      "Read(//c/development/git/IncubatorConsole/esp32-gateway-platformio/src//**)",
+      "Bash(cat \"/c/development/git/IncubatorConsole/.gitignore\" 2>&1 | grep -i config)"
+    ],
+    "additionalDirectories": [
+      "C:\\development\\git\\IncubatorConsole\\esp32-incubator-platformio\\src",
+      "C:\\development\\git\\IncubatorConsole\\esp32-gateway-platformio\\src"
+    ]
+  }
+}

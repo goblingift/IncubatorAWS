@@ -56,3 +56,24 @@ class SensorValidator:
             if v in {"false", "0", "no", "off"}:
                 return 0
         return None
+
+    @staticmethod
+    def parse_bitmask(value, num_bits):
+        value = SensorValidator.clean_scalar(value)
+        if isinstance(value, bool):
+            return None
+        iv = None
+        if isinstance(value, int):
+            iv = value
+        elif isinstance(value, Decimal):
+            if value == int(value):
+                iv = int(value)
+        elif isinstance(value, str) and NUMERIC_PATTERN.fullmatch(value):
+            try:
+                iv = int(Decimal(value))
+            except InvalidOperation:
+                return None
+        if iv is None:
+            return None
+        max_value = (1 << num_bits) - 1
+        return iv if 0 <= iv <= max_value else None

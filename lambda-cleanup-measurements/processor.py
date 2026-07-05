@@ -27,6 +27,14 @@ class MeasurementProcessor:
                 continue
             clean_item[field] = normalized
 
+        if "actuator_state" in clean_item:
+            bitmask = clean_item.pop("actuator_state")
+            clean_item["relay_state_1"] = 1 if (bitmask & 0b00001) else 0
+            clean_item["relay_state_2"] = 1 if (bitmask & 0b00010) else 0
+            clean_item["relay_state_3"] = 1 if (bitmask & 0b00100) else 0
+            clean_item["relay_state_4"] = 1 if (bitmask & 0b01000) else 0
+            clean_item["humidifier_state"] = 1 if (bitmask & 0b10000) else 0
+
         for field in OPTIONAL_PASSTHROUGH_FIELDS:
             if field in raw:
                 clean_item[field] = raw[field]
@@ -73,6 +81,12 @@ class MeasurementProcessor:
             parsed = SensorValidator.parse_bool_int(value)
             if parsed is None:
                 return None, [f"{field}: invalid boolean"]
+            return parsed, []
+
+        if field_type == "bitmask":
+            parsed = SensorValidator.parse_bitmask(value, rules["bits"])
+            if parsed is None:
+                return None, [f"{field}: invalid bitmask"]
             return parsed, []
 
         if field_type == "decimal":

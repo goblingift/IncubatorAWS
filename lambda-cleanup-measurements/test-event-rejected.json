@@ -19,7 +19,7 @@
           "humidity_rh": { "N": "150" },
           "co2_ppm": { "N": "820" },
           "voltage": { "N": "12.1" },
-          "relay_state": { "N": "5" }
+          "actuator_state": { "N": "5" }
         },
         "SequenceNumber": "111000000000000000002",
         "SizeBytes": 300,

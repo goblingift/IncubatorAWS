@@ -20,7 +20,7 @@
           "co2_ppm": { "N": "820" },
           "voltage": { "N": "12.1" },
           "current": { "N": "0.8" },
-          "relay_state": { "N": "1" },
+          "actuator_state": { "N": "21" },
           "weight_gram": { "N": "1450.5" },
           "light_intensity": { "N": "300" },
           "sound_intensity": { "N": "42.3" },
