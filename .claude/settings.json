@@ -15,11 +15,15 @@
       "PowerShell(Get-Command python, python3, py -ErrorAction SilentlyContinue)",
       "Bash(ls -la \"/c/development/git/IncubatorConsole/esp32-gateway-platformio/src/\" | grep -i config)",
       "Read(//c/development/git/IncubatorConsole/esp32-gateway-platformio/src//**)",
-      "Bash(cat \"/c/development/git/IncubatorConsole/.gitignore\" 2>&1 | grep -i config)"
+      "Bash(cat \"/c/development/git/IncubatorConsole/.gitignore\" 2>&1 | grep -i config)",
+      "WebFetch(domain:aws.amazon.com)",
+      "Bash(mkdir -p \"/c/Users/andre/AppData/Local/Temp/claude/c--development-git-IncubatorAWS/8304fb27-968d-43d6-a526-1eb200bc5f50/scratchpad\")",
+      "WebFetch(domain:github.com)"
     ],
     "additionalDirectories": [
       "C:\\development\\git\\IncubatorConsole\\esp32-incubator-platformio\\src",
-      "C:\\development\\git\\IncubatorConsole\\esp32-gateway-platformio\\src"
+      "C:\\development\\git\\IncubatorConsole\\esp32-gateway-platformio\\src",
+      "C:\\Users\\andre\\AppData\\Local\\Temp\\claude\\c--development-git-IncubatorAWS\\8304fb27-968d-43d6-a526-1eb200bc5f50\\scratchpad"
     ]
   }
 }
