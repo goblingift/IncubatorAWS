@@ -104,8 +104,8 @@ Per-device configuration of alert thresholds, written via
 
 | Field | Applies to measurement |
 |---|---|
-| `temperature_target`, `temperature_min`, `temperature_max` | `temperature_celsius` |
-| `humidity_target`, `humidity_min`, `humidity_max` | `humidity_rh` |
+| `temperature_min`, `temperature_max` | `temperature_celsius` |
+| `humidity_min`, `humidity_max` | `humidity_rh` |
 | `co2_max` | `co2_ppm` |
 | `light_max` | `light_intensity` |
 | `sound_max` | `sound_intensity` |
@@ -126,6 +126,12 @@ measurements.
 > `gyroscope_y_max`, `gyroscope_z_max` instead of `pitch_deg_max`/
 > `roll_deg_max`. Any pre-existing rows written before this change will not
 > have the new fields — see [Migration notes](#migration-notes).
+
+> **Note (historical):** this table previously also had `temperature_target`
+> and `humidity_target` fields (an operator-facing "ideal value" shown on the
+> frontend dashboard, separate from the min/max alert bounds). They were
+> dropped as redundant with min/max — pre-existing rows may still carry these
+> keys, but no Lambda reads or writes them anymore.
 
 ### `incubator_alerts`
 - **Partition key:** `device_id` (String)
@@ -277,6 +283,13 @@ skips a field's check if its threshold key isn't present in the settings row
 (no error, no false alert) — so old rows degrade gracefully but silently
 under-alert until re-submitted via `incubator-settings-post` with the full,
 current field set.
+
+`temperature_target` and `humidity_target` were removed from the settings
+schema — they were only ever a display value for the frontend dashboard and
+were never read by `incubator-threshold-alert`'s threshold checks. Existing
+rows may still carry these keys; they're simply ignored (`incubator-settings-
+post` no longer accepts or writes them, and `incubator-settings-get`'s
+`DEFAULT_SETTINGS` no longer includes them).
 
 The incoming device/gateway field for relay state was renamed from
 `relay_state` to `actuator_state`. It's still a single `uint8_t` bitmask sent

@@ -3,10 +3,8 @@ import os
 TABLE_NAME = os.environ.get("TABLE_NAME", "incubator_settings")
 
 DEFAULT_SETTINGS = {
-    "temperature_target": 37.5,
     "temperature_min": 36,
     "temperature_max": 39,
-    "humidity_target": 55,
     "humidity_min": 45,
     "humidity_max": 70,
     "co2_max": 7100,

@@ -3,10 +3,8 @@ import os
 TABLE_NAME = os.environ.get("TABLE_NAME", "incubator_settings")
 
 NUMERIC_FIELDS = [
-    "temperature_target",
     "temperature_min",
     "temperature_max",
-    "humidity_target",
     "humidity_min",
     "humidity_max",
     "co2_max",
