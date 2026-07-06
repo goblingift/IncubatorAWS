@@ -6,7 +6,8 @@ flowchart TD
     Validate -- yes --> CleanTable[(incubator_measurement_clean)]
     Validate -- no --> RejectedTable[(incubator_measurement_rejected)]
 
-    RejectedTable --> EndRejected([Stored for debugging, no further action])
+    RejectedTable --> EndRejected([Stored for debugging])
+    RejectedTable -. scanned hourly .-> HasRecentRejections
 
     CleanTable -- DynamoDB Stream: INSERT/MODIFY --> AlertLambda[incubator-threshold-alert]
 
@@ -56,3 +57,12 @@ flowchart TD
 
     HourlyTable -. read by .-> QueryHourly
     SettingsTable -. read by .-> HasLightSettings
+
+    subgraph Rejected Measurements Alert
+        direction TB
+        RejectSchedule([EventBridge: hourly]) --> RejectAlertLambda[incubator-measurements-rejected-alert]
+        RejectAlertLambda --> HasRecentRejections{Any rejections in\nlast 60 minutes?}
+        HasRecentRejections -- no --> EndNoRejections([No notification])
+        HasRecentRejections -- yes --> PublishRejectSns[[SNS: incubator-measurement-rejected]]
+        PublishRejectSns --> RejectSubscribers([Email subscribers notified])
+    end

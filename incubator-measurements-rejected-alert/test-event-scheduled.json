@@ -1,0 +1,13 @@
+{
+  "version": "0",
+  "id": "22223333-4444-5555-6666-777788889999",
+  "detail-type": "Scheduled Event",
+  "source": "aws.events",
+  "account": "683966915447",
+  "time": "2026-07-06T15:00:00Z",
+  "region": "eu-north-1",
+  "resources": [
+    "arn:aws:events:eu-north-1:683966915447:rule/incubator-measurements-rejected-hourly"
+  ],
+  "detail": {}
+}

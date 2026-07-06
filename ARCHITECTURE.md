@@ -48,6 +48,15 @@ incubator-light-rollup  ---->  incubator_light_hourly (TTL'd hourly buckets)
 incubator_settings ----> incubator-light-average-alert (scanned each run for
                                                           devices with
                                                           light_avg_max set)
+
+incubator_measurement_rejected
+     |  (scanned on an hourly EventBridge schedule)
+     v
+incubator-measurements-rejected-alert  ---->  SNS topic
+                                               (incubator-measurement-rejected)
+                                                    |
+                                                    v
+                                               email subscribers
 ```
 
 Note: `incubator_measurement_clean`'s DynamoDB Stream has two independent
@@ -60,7 +69,8 @@ There are three triggers into this system:
 - **DynamoDB Streams**, for the automatic cleaning/alerting/rollup pipeline.
 - **API Gateway (HTTP)**, for reading/writing device settings and querying the
   latest measurement, presumably used by a frontend/dashboard.
-- **EventBridge (scheduled)**, for the hourly rolling-average light check.
+- **EventBridge (scheduled)**, for the hourly rolling-average light check and
+  the hourly rejected-measurements check.
 
 ---
 
@@ -111,13 +121,22 @@ DynamoDB Streams is also enabled on this table (`NEW_IMAGE`), which triggers
 Same partition/sort key shape as the clean table. Holds measurements that
 failed one or more validation rules, written by `lambda-cleanup-measurements`.
 Each item contains:
-- `device_id`, `timestamp` (best-effort parsed, or falls back to `"unknown"`/
-  the processing time if unparseable)
-- `processed_at`
+- `device_id` (falls back to `"unknown"` if missing/unparseable in the raw
+  payload)
+- `timestamp` (the raw payload's own timestamp if it parsed as a valid
+  epoch int, otherwise falls back to `processed_at` — so this field is
+  always a valid epoch int, never a placeholder string)
+- `processed_at` (epoch int, always server-side/reliable — this is what
+  `incubator-measurements-rejected-alert` filters on, since a rejected
+  record's own `timestamp` can't always be trusted as "when it actually
+  happened")
 - `cleaning_status: "rejected"`
 - `rejection_reasons` (list of human-readable strings, one per failed field)
 - `rejection_reason` (same list, joined with `"; "`, for easy console viewing)
 - `raw_payload` (the original, unmodified raw item, DynamoDB-compatible)
+
+Read (via full-table `scan()`) by `incubator-measurements-rejected-alert` on
+an hourly schedule.
 
 ### `incubator_settings`
 - **Partition key:** `device_id` (String)
@@ -338,21 +357,54 @@ Once per hour:
 Unlike `incubator-threshold-alert`, this can raise at most one alert per
 device per hour, rather than one per violating measurement.
 
+### `incubator-measurements-rejected-alert`
+**Trigger:** EventBridge scheduled rule, hourly (`cron(0 * * * ? *)`).
+**Files:** `lambda_function.py`, `config.py`, `repository.py`
+
+Once per hour:
+1. Scans `incubator_measurement_rejected` (full-table `scan()` with a
+   `FilterExpression` on `processed_at >= now - 60min` — this table has no
+   index suited to "everything rejected across all devices in the last
+   hour," and rejections are the exception path rather than the common one,
+   so a scan should stay cheap).
+2. If any rows matched, publishes a single SNS notification listing each
+   rejected item's `device_id`, `timestamp`, and `rejection_reason`. If none
+   matched, does nothing — no notification, no `incubator_alerts` row (this
+   Lambda deliberately doesn't write to `incubator_alerts`, since that
+   table's schema — `field`/`value`/`bound`/`threshold` — models a range
+   violation, not a validation failure with a list of free-text reasons; a
+   direct SNS notification fits better).
+
+Publishes to its own dedicated SNS topic, separate from
+`incubator-measurement-outside-allowed-range` — see Notifications below.
+
 ---
 
 ## Notifications (SNS)
 
-Topic: `incubator-measurement-outside-allowed-range`
+Two independent topics, with separate email subscriptions — a subscriber to
+one does not automatically receive the other:
+
+### `incubator-measurement-outside-allowed-range`
 (`arn:aws:sns:eu-north-1:683966915447:incubator-measurement-outside-allowed-range`)
 
 Published to by `incubator-threshold-alert` once per violation (a single
-measurement with multiple out-of-range fields produces multiple messages).
-Subscribers (e.g. email) receive one notification per violated field, per
-measurement. Confirmed working via a live end-to-end test (temperature
+measurement with multiple out-of-range fields produces multiple messages)
+and by `incubator-light-average-alert` at most once per device per hour.
+Subscribers (e.g. email) receive one notification per violated
+field/check. Confirmed working via a live end-to-end test (temperature
 violation → `incubator_alerts` row + email delivered).
 
 No further downstream automation (e.g. auto-adjusting a heater relay) is
 wired up yet — that's an open, explicitly deferred discussion.
+
+### `incubator-measurement-rejected`
+(`arn:aws:sns:eu-north-1:683966915447:incubator-measurement-rejected`)
+
+Published to by `incubator-measurements-rejected-alert`, at most once per
+hour, only when at least one measurement was rejected in that window. This
+is a data-quality signal (validation failures), deliberately kept separate
+from the threshold-violation topic above.
 
 ---
 
@@ -388,6 +440,15 @@ not a stream consumer. It also needs a resource-based Lambda permission
 EventBridge rule's ARN) so the schedule can invoke it — this is separate
 from the execution role above and is usually added automatically if the
 trigger is wired up via the Lambda console's "Add trigger" flow.
+
+`incubator-measurements-rejected-alert`'s execution role includes the inline
+policy `AccessRejectedAlert`, granting:
+- `dynamodb:Scan` on `incubator_measurement_rejected`
+- `sns:Publish` on the `incubator-measurement-rejected` topic
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — same EventBridge
+invoke-permission note as `incubator-light-average-alert` above applies here
+too.
 
 ---
 
@@ -467,3 +528,4 @@ in the Lambda console's "Test" tab:
 | `incubator-threshold-alert/test-event-violation.json` | incubator-threshold-alert | one field (temperature) out of range → one alert + SNS publish |
 | `incubator-light-rollup/test-event-rollup.json` | incubator-light-rollup | one clean measurement → hourly bucket incremented |
 | `incubator-light-average-alert/test-event-scheduled.json` | incubator-light-average-alert | simulated hourly EventBridge tick |
+| `incubator-measurements-rejected-alert/test-event-scheduled.json` | incubator-measurements-rejected-alert | simulated hourly EventBridge tick |
