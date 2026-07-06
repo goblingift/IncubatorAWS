@@ -40,3 +40,19 @@ flowchart TD
     end
 
     CleanTable -. read by .-> LatestLambda
+
+    CleanTable -- DynamoDB Stream: INSERT (2nd consumer) --> RollupLambda[incubator-light-rollup]
+    RollupLambda --> HourlyTable[(incubator_light_hourly)]
+
+    subgraph Light Rolling Average
+        direction TB
+        Schedule([EventBridge: hourly]) --> AvgLambda[incubator-light-average-alert]
+        AvgLambda --> HasLightSettings{Devices with\nlight_avg_max?}
+        HasLightSettings -- yes --> QueryHourly[Sum last 24h of buckets]
+        QueryHourly --> AvgViolation{Average >\nlight_avg_max?}
+        AvgViolation -- yes --> WriteAvgAlert[(incubator_alerts)]
+        AvgViolation -- yes --> PublishAvgSns[[SNS: incubator-measurement-\noutside-allowed-range]]
+    end
+
+    HourlyTable -. read by .-> QueryHourly
+    SettingsTable -. read by .-> HasLightSettings

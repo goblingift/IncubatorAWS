@@ -30,12 +30,37 @@ lambda-cleanup-measurements  ---->  incubator_measurement_clean
 incubator_settings (DynamoDB) <---- incubator-settings-post  (HTTP POST, API Gateway)
 incubator_settings (DynamoDB) ----> incubator-settings-get   (HTTP GET,  API Gateway)
 incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gateway)
+
+incubator_measurement_clean
+     |  (INSERT only, second stream consumer — see note below)
+     v
+incubator-light-rollup  ---->  incubator_light_hourly (TTL'd hourly buckets)
+                                        |
+                                        | queried on an hourly EventBridge schedule
+                                        v
+                          incubator-light-average-alert
+                                   |         \
+                                   v          v
+                          incubator_alerts   SNS topic
+                                             (incubator-measurement-
+                                              outside-allowed-range)
+
+incubator_settings ----> incubator-light-average-alert (scanned each run for
+                                                          devices with
+                                                          light_avg_max set)
 ```
 
-There are two triggers into this system:
-- **DynamoDB Streams**, for the automatic cleaning/alerting pipeline.
+Note: `incubator_measurement_clean`'s DynamoDB Stream has two independent
+consumers (`incubator-threshold-alert` and `incubator-light-rollup`) — this is
+at DynamoDB Streams' documented limit of 2 concurrent Lambda readers per
+shard. A 3rd consumer would need restructuring (e.g. combining concerns into
+one Lambda, or moving to Kinesis Data Streams for DynamoDB).
+
+There are three triggers into this system:
+- **DynamoDB Streams**, for the automatic cleaning/alerting/rollup pipeline.
 - **API Gateway (HTTP)**, for reading/writing device settings and querying the
   latest measurement, presumably used by a frontend/dashboard.
+- **EventBridge (scheduled)**, for the hourly rolling-average light check.
 
 ---
 
@@ -107,7 +132,7 @@ Per-device configuration of alert thresholds, written via
 | `temperature_min`, `temperature_max` | `temperature_celsius` |
 | `humidity_min`, `humidity_max` | `humidity_rh` |
 | `co2_max` | `co2_ppm` |
-| `light_max` | `light_intensity` |
+| `light_avg_max` | `light_intensity` (checked as a rolling 24h average, not per-reading — see `incubator-light-average-alert`) |
 | `sound_max` | `sound_intensity` |
 | `weight_min`, `weight_max` | `weight_gram` |
 | `pitch_deg_max` | `pitch_deg` (checked against absolute value) |
@@ -132,6 +157,40 @@ measurements.
 > frontend dashboard, separate from the min/max alert bounds). They were
 > dropped as redundant with min/max — pre-existing rows may still carry these
 > keys, but no Lambda reads or writes them anymore.
+
+> **Note (historical):** this table previously had `light_max`, an
+> instantaneous per-reading cap on `light_intensity`. It was replaced with
+> `light_avg_max`, a threshold on the rolling 24-hour average of
+> `light_intensity` (evaluated hourly by `incubator-light-average-alert`, not
+> per-measurement) — a single momentary bright flash no longer trips an
+> alert, but a sustained elevated light level over a day does. Existing rows
+> written before this change will have `light_max` but not `light_avg_max`;
+> since `incubator-settings-post` overwrites the whole item via `put_item`,
+> the stale `light_max` key is dropped automatically the next time that
+> device's settings are re-submitted.
+
+### `incubator_light_hourly`
+- **Partition key:** `device_id` (String)
+- **Sort key:** `hour_bucket` (Number, epoch seconds floored to the start of
+  the UTC hour: `int(timestamp // 3600 * 3600)`)
+
+Rolling accumulator populated by `incubator-light-rollup`, one item per
+device per hour. Fields:
+- `light_sum` — running sum of `light_intensity` (lux) for readings that
+  fell in this hour bucket
+- `reading_count` — number of readings summed into `light_sum`
+- `expires_at` — epoch seconds TTL attribute (`hour_bucket + 48h`); DynamoDB
+  auto-deletes old buckets, no cleanup job needed. 48h gives ~2x headroom
+  over the 24h lookback window used by `incubator-light-average-alert`; TTL
+  deletion itself is best-effort (AWS may take up to ~48h after `expires_at`
+  to actually purge), which doesn't matter for correctness since consumers
+  always bound their `hour_bucket` query range explicitly.
+
+`light_sum`/`reading_count` were deliberately named as compound identifiers
+rather than the bare words `sum`/`count`, since those are DynamoDB reserved
+words in expression syntax; DynamoDB's reserved-word check is whole-token
+(not substring), so compound names like these are unaffected — the same way
+this schema already uses `timestamp` (itself reserved) safely elsewhere.
 
 ### `incubator_alerts`
 - **Partition key:** `device_id` (String)
@@ -231,6 +290,54 @@ For each new clean measurement:
 
 Same partial-batch-failure pattern as the cleanup Lambda.
 
+### `incubator-light-rollup`
+**Trigger:** DynamoDB Stream on `incubator_measurement_clean` — this is the
+stream's **second** independent consumer, alongside
+`incubator-threshold-alert` (`INSERT` events only; unlike
+`incubator-threshold-alert`, `MODIFY` is intentionally skipped here since
+this Lambda accumulates a running sum, and re-processing a `MODIFY` on an
+already-counted reading would double-count it, with no `OldImage` available
+to reconcile against since the stream is `NEW_IMAGE`-only).
+**Files:** `lambda_function.py`, `config.py`, `repository.py`
+
+For each new clean measurement with `cleaning_status: "clean"` and a
+present, non-null `light_intensity` (checked by presence/`None`, not
+truthiness — `0` lux is a legitimate, common reading and must still count):
+1. Computes `hour_bucket` by flooring the measurement's `timestamp` to the
+   start of its UTC hour.
+2. Atomically increments that device/hour's row in `incubator_light_hourly`
+   (`ADD light_sum, reading_count`), creating the row if it doesn't exist
+   yet, and refreshes its TTL (`expires_at`).
+
+Same partial-batch-failure pattern as the other stream Lambdas.
+
+### `incubator-light-average-alert`
+**Trigger:** EventBridge scheduled rule, hourly (`cron(0 * * * ? *)`) — the
+first use of EventBridge in this repo.
+**Files:** `lambda_function.py`, `config.py`, `repository.py`
+
+Once per hour:
+1. Scans `incubator_settings` for devices with a `light_avg_max` configured
+   (small table, few devices — same "fine at prototype scale" justification
+   as `incubator-latest-reading`'s full-table-scan fallback).
+2. For each such device, queries `incubator_light_hourly` for the current
+   hour bucket plus the previous 23 (~24h trailing window, hour-granularity
+   rather than a true second-level sliding window — acceptable since a
+   24-hour average doesn't need sub-hour precision), sums `light_sum` and
+   `reading_count` across the returned buckets, and computes the average.
+3. Skips the device if no readings were found in that window (e.g. device
+   offline) — no false alert, same "skip when data is absent" philosophy as
+   `incubator-threshold-alert` skipping devices with no settings row.
+4. If the average exceeds `light_avg_max`: writes a row to
+   `incubator_alerts` (`field: "light_intensity_avg_24h"`, `timestamp` set
+   to the current hour bucket rather than a single offending measurement's
+   timestamp, since this is an aggregate check, not a per-measurement one)
+   and publishes to the same SNS topic as `incubator-threshold-alert`, same
+   plain `sns.publish(...)` style.
+
+Unlike `incubator-threshold-alert`, this can raise at most one alert per
+device per hour, rather than one per violating measurement.
+
 ---
 
 ## Notifications (SNS)
@@ -259,6 +366,28 @@ policy `AccessDynamoDBSettingsAndPublishSNS`, which must grant:
 
 plus the AWS-managed `AWSLambdaDynamoDBExecutionRole` (stream read access) and
 `AWSLambdaBasicExecutionRole` (CloudWatch Logs).
+
+`incubator-light-rollup`'s execution role includes the inline policy
+`AccessLightHourlyRollup`, granting:
+- `dynamodb:UpdateItem` on `incubator_light_hourly`
+
+plus `AWSLambdaDynamoDBExecutionRole` (stream read access) and
+`AWSLambdaBasicExecutionRole` (CloudWatch Logs).
+
+`incubator-light-average-alert`'s execution role includes the inline policy
+`AccessLightAverageAlert`, granting:
+- `dynamodb:Scan` on `incubator_settings`
+- `dynamodb:Query` on `incubator_light_hourly`
+- `dynamodb:PutItem` on `incubator_alerts`
+- `sns:Publish` on the `incubator-measurement-outside-allowed-range` topic
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — **not**
+`AWSLambdaDynamoDBExecutionRole`, since this Lambda is EventBridge-triggered,
+not a stream consumer. It also needs a resource-based Lambda permission
+(`lambda:InvokeFunction` for principal `events.amazonaws.com`, scoped to the
+EventBridge rule's ARN) so the schedule can invoke it — this is separate
+from the execution role above and is usually added automatically if the
+trigger is wired up via the Lambda console's "Add trigger" flow.
 
 ---
 
@@ -312,6 +441,15 @@ written before this change will have the old `relay_state` key and will not
 have `relay_state_1`–`relay_state_4` or `humidifier_state`. Rows written
 after this change will have the 5 new keys and will not have `relay_state`.
 
+`light_max` (instantaneous per-reading cap, checked by
+`incubator-threshold-alert` on every measurement) was replaced with
+`light_avg_max` (24h rolling average threshold, checked hourly by the new
+`incubator-light-average-alert`):
+
+| Old field | New field |
+|---|---|
+| `light_max` (instant per-reading cap) | `light_avg_max` (24h rolling average threshold, checked hourly) |
+
 ---
 
 ## Test Events
@@ -327,3 +465,5 @@ in the Lambda console's "Test" tab:
 | `incubator-settings-get/test-event-existing-device.json` | incubator-settings-get | fetch a configured device |
 | `incubator-settings-get/test-event-unknown-device.json` | incubator-settings-get | fetch an unconfigured device → defaults |
 | `incubator-threshold-alert/test-event-violation.json` | incubator-threshold-alert | one field (temperature) out of range → one alert + SNS publish |
+| `incubator-light-rollup/test-event-rollup.json` | incubator-light-rollup | one clean measurement → hourly bucket incremented |
+| `incubator-light-average-alert/test-event-scheduled.json` | incubator-light-average-alert | simulated hourly EventBridge tick |

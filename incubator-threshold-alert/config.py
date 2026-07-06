@@ -9,7 +9,6 @@ THRESHOLD_FIELDS = {
     "temperature_celsius": {"min": "temperature_min", "max": "temperature_max"},
     "humidity_rh": {"min": "humidity_min", "max": "humidity_max"},
     "co2_ppm": {"max": "co2_max"},
-    "light_intensity": {"max": "light_max"},
     "sound_intensity": {"max": "sound_max"},
     "weight_gram": {"min": "weight_min", "max": "weight_max"},
     "pitch_deg": {"max": "pitch_deg_max", "abs": True},

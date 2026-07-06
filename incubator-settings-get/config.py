@@ -8,7 +8,7 @@ DEFAULT_SETTINGS = {
     "humidity_min": 45,
     "humidity_max": 70,
     "co2_max": 7100,
-    "light_max": 7,
+    "light_avg_max": 500,
     "pitch_deg_max": 15,
     "roll_deg_max": 15,
     "sound_max": 80,

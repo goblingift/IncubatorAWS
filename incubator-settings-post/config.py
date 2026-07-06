@@ -8,7 +8,7 @@ NUMERIC_FIELDS = [
     "humidity_min",
     "humidity_max",
     "co2_max",
-    "light_max",
+    "light_avg_max",
     "pitch_deg_max",
     "roll_deg_max",
     "sound_max",
