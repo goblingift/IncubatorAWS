@@ -29,7 +29,11 @@ lambda-cleanup-measurements  ---->  incubator_measurement_clean
 
 incubator_settings (DynamoDB) <---- incubator-settings-post  (HTTP POST, API Gateway)
 incubator_settings (DynamoDB) ----> incubator-settings-get   (HTTP GET,  API Gateway)
-incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gateway)
+incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gateway,
+                                                               /sensor/latest/{device_id})
+incubator_measurement_clean   ----> incubator-measurements-range (HTTP GET, API Gateway,
+                                                                   /sensor/measurements/{device_id}
+                                                                   ?range=1h|24h|7d)
 incubator_alerts (DynamoDB)   ----> incubator-alerts-get     (HTTP GET,  API Gateway,
                                                                Cognito-authorized)
 
@@ -304,13 +308,55 @@ accumulates enough rows to make the response slow or large.
 ### `incubator-latest-reading`
 **Trigger:** API Gateway HTTP `GET` (proxy integration), optional
 `{device_id}` path parameter.
-**Files:** `lambda_function.py` (single file)
+**Files:** `lambda_function.py`, `response_utils.py`
 
 If `device_id` is given, queries `incubator_measurement_clean` for that
 device's most recent item (`ScanIndexForward=False, Limit=1`). If omitted,
 falls back to a full table `scan()` and picks the most recent item across all
 devices — note this is O(table size) and will not scale well as the table
 grows; fine for small/prototype-scale usage.
+
+Returns the full item unfiltered — every field written by
+`lambda-cleanup-measurements` is present in the response, nothing is
+dropped. Originally serialized with `json.dumps(body, default=str)`, which
+silently stringified every `Decimal` (e.g. `temperature_celsius` came back
+as `"37.5"`, a string, not a number); fixed to use the same
+`response_utils.py` (`DecimalEncoder`-based) helper as `incubator-settings-
+get`/`incubator-alerts-get`/`incubator-measurements-range`, so numeric
+fields are now real JSON numbers.
+
+### `incubator-measurements-range`
+**Trigger:** API Gateway HTTP `GET` (proxy integration) at
+`/sensor/measurements/{device_id}` — a sibling resource under the same
+`/sensor` path as `incubator-latest-reading`'s `/sensor/latest/{device_id}`,
+rather than its own top-level resource. Expects `{device_id}` as a path
+parameter and an optional `range` query-string parameter (`1h`, `24h`, or
+`7d`; defaults to `24h`, `400` on any other value).
+**Files:** `lambda_function.py`, `config.py`, `repository.py`,
+`downsampler.py`, `response_utils.py`
+
+Computes `start`/`end` epoch bounds from the requested range, then queries
+`incubator_measurement_clean` for that device across the window
+(`Key("device_id").eq(device_id) & Key("timestamp").between(start, end)`,
+`ScanIndexForward=True` — ascending, correct order for a time series),
+paginating on `LastEvaluatedKey` (bounded to one partition/time window, not
+a full scan).
+
+If the query returns more than `MAX_POINTS` (500) items, `downsampler.py`
+buckets them into `MAX_POINTS` evenly-sized time windows
+(`bucket_width = (end - start) / MAX_POINTS`, same flooring idea as
+`incubator-light-rollup`'s `hour_bucket`) and averages every numeric field
+per bucket — including the 0/1 actuator fields (`relay_state_1-4`,
+`humidifier_state`), which average out to a meaningful "fraction of time
+on" for that bucket rather than being dropped. Below the threshold, points
+are returned raw and unaveraged — so the "last hour" view is typically full
+resolution, while "last 7 days" is usually downsampled.
+
+Returns the array directly (`200`, `[]` if the device has no data in the
+window). Handles `OPTIONS` preflight for CORS. Unlike `incubator-alerts-
+get`, this endpoint is **not** behind the Cognito authorizer — it's public,
+matching `incubator-latest-reading` and the fact it backs the (unprotected)
+Dashboard page.
 
 ### `incubator-threshold-alert`
 **Trigger:** DynamoDB Stream on `incubator_measurement_clean` (`INSERT`/
@@ -488,6 +534,14 @@ itself) is additionally gated by the Cognito authorizer shared with
 consistent with how `incubator-settings-post` also trusts API Gateway to
 reject unauthorized requests before invocation.
 
+`incubator-measurements-range`'s execution role includes the inline policy
+`ReadIncubatorMeasurements`, granting:
+- `dynamodb:Query` on `incubator_measurement_clean`
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role
+(API-Gateway-triggered). Its `GET` method has Authorization set to NONE,
+same as `incubator-latest-reading`.
+
 ---
 
 ## Migration Notes
@@ -569,3 +623,7 @@ in the Lambda console's "Test" tab:
 | `incubator-measurements-rejected-alert/test-event-scheduled.json` | incubator-measurements-rejected-alert | simulated hourly EventBridge tick |
 | `incubator-alerts-get/test-event-existing-device.json` | incubator-alerts-get | fetch alerts for a device with rows |
 | `incubator-alerts-get/test-event-unknown-device.json` | incubator-alerts-get | fetch alerts for a device with none → `[]` |
+| `incubator-measurements-range/test-event-last-hour.json` | incubator-measurements-range | `range=1h`, typically raw/undownsampled |
+| `incubator-measurements-range/test-event-last-24h.json` | incubator-measurements-range | `range=24h` |
+| `incubator-measurements-range/test-event-last-7d.json` | incubator-measurements-range | `range=7d`, typically triggers downsampling |
+| `incubator-measurements-range/test-event-unknown-device.json` | incubator-measurements-range | device with no data → `[]` |

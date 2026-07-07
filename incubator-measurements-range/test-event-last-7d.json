@@ -1,0 +1,9 @@
+{
+  "httpMethod": "GET",
+  "pathParameters": {
+    "device_id": "incubator-test-002"
+  },
+  "queryStringParameters": {
+    "range": "7d"
+  }
+}

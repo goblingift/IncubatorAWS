@@ -1,0 +1,9 @@
+{
+  "httpMethod": "GET",
+  "pathParameters": {
+    "device_id": "incubator-does-not-exist"
+  },
+  "queryStringParameters": {
+    "range": "24h"
+  }
+}
