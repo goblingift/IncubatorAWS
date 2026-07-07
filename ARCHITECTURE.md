@@ -81,6 +81,42 @@ There are three triggers into this system:
 
 ---
 
+## AWS IoT Rule
+
+Not represented as code anywhere else (console-configured, like API Gateway) —
+recorded here so it doesn't drift out of sync with the firmware unnoticed
+again (see Migration Notes: the `relayState`/`actuator_state` mismatch below).
+
+The gateway (`esp32-gateway-platformio`) publishes one MQTT message per
+reading to topic `incubator/data`, with a JSON body whose keys are now
+identical to `incubator_measurement_raw`'s expected field names (see
+`formatDeviceId()` and the `doc[...]` assignments in
+`esp32-gateway-platformio/src/main.cpp`). Because of that, the rule that
+inserts into `incubator_measurement_raw` is a plain passthrough — no
+`SELECT ... AS ...` aliasing needed:
+
+```sql
+SELECT * FROM 'incubator/data'
+```
+
+Action: DynamoDBv2, table `incubator_measurement_raw`.
+
+**Historical note:** before the firmware sent AWS-native field names
+directly, this rule did the renaming itself (`lux AS light_intensity`, `co2
+AS co2_ppm`, etc.). One line — `relayState AS relay_state` — referenced a
+field the gateway never actually published (it sent `actuatorState`, not
+`relayState`) and aliased it to a name `lambda-cleanup-measurements` doesn't
+recognize either (it expects `actuator_state`, singular, which it then
+decomposes into `relay_state_1..4` + `humidifier_state`). Since
+`actuator_state` isn't a required field, this failed silently — every
+measurement's real relay/humidifier state was dropped before reaching
+`incubator_measurement_clean`, with no error anywhere. Moving the
+renaming into firmware (version-controlled, code-reviewed) instead of an
+IoT Rule (console-only state, no diff, no tests) was a deliberate fix for
+that class of bug, not just this one instance of it.
+
+---
+
 ## DynamoDB Tables
 
 ### `incubator_measurement_raw`
@@ -588,6 +624,16 @@ single `relay_state`:
 |---|---|
 | `relay_state` (bitmask bit0–bit3) | `relay_state_1`, `relay_state_2`, `relay_state_3`, `relay_state_4` |
 | *(none — bit4 was unused)* | `humidifier_state` |
+
+**This migration is what caused the bug described in "AWS IoT Rule" above.**
+The firmware and `lambda-cleanup-measurements` were both updated to the new
+`actuator_state` name, but the IoT Rule's `SELECT` — console-only state, not
+part of either code review — kept its pre-migration alias (`relayState AS
+relay_state`), which matched neither the old nor the new name correctly.
+Every real device's relay/humidifier state silently failed to reach
+`incubator_measurement_clean` from that point on. Fixed by moving field
+naming out of the IoT Rule entirely (see above) rather than just correcting
+this one alias, so the same class of drift can't happen again.
 
 Existing `incubator_measurement_clean`/`incubator_measurement_rejected` rows
 written before this change will have the old `relay_state` key and will not
