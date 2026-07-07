@@ -1,0 +1,6 @@
+{
+  "httpMethod": "GET",
+  "pathParameters": {
+    "device_id": "incubator-does-not-exist"
+  }
+}

@@ -30,6 +30,8 @@ lambda-cleanup-measurements  ---->  incubator_measurement_clean
 incubator_settings (DynamoDB) <---- incubator-settings-post  (HTTP POST, API Gateway)
 incubator_settings (DynamoDB) ----> incubator-settings-get   (HTTP GET,  API Gateway)
 incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gateway)
+incubator_alerts (DynamoDB)   ----> incubator-alerts-get     (HTTP GET,  API Gateway,
+                                                               Cognito-authorized)
 
 incubator_measurement_clean
      |  (INSERT only, second stream consumer — see note below)
@@ -67,8 +69,9 @@ one Lambda, or moving to Kinesis Data Streams for DynamoDB).
 
 There are three triggers into this system:
 - **DynamoDB Streams**, for the automatic cleaning/alerting/rollup pipeline.
-- **API Gateway (HTTP)**, for reading/writing device settings and querying the
-  latest measurement, presumably used by a frontend/dashboard.
+- **API Gateway (HTTP)**, for reading/writing device settings, querying the
+  latest measurement, and browsing a device's alert history, presumably used
+  by a frontend/dashboard.
 - **EventBridge (scheduled)**, for the hourly rolling-average light check and
   the hourly rejected-measurements check.
 
@@ -275,6 +278,29 @@ a default settings object (`DEFAULT_SETTINGS` in `config.py`) covering the
 full current schema, so a not-yet-configured device still gets a usable
 response shape instead of an error or a stale/incomplete field set.
 
+### `incubator-alerts-get`
+**Trigger:** API Gateway HTTP `GET` (proxy integration), expects
+`{device_id}` as a path parameter. Unlike the other read Lambdas, this
+method's API Gateway route is protected by the same Cognito User Pool
+authorizer used for `POST /settings` — alert history is treated as more
+sensitive than raw sensor readings or settings.
+**Files:** `lambda_function.py`, `config.py`, `repository.py`,
+`response_utils.py`
+
+Queries `incubator_alerts` for every row matching the given `device_id`
+(`table.query`, paginating on `LastEvaluatedKey` — bounded to a single
+partition, not a full-table scan), then sorts the combined list by
+`checked_at` descending in Python, since the table's sort key (`alert_id`,
+a generated UUID) carries no chronological ordering. Returns the array
+directly (`200` with a JSON array, `[]` if the device has no alerts), rather
+than wrapping it in an object. Responds `400` if `device_id` is missing.
+Handles `OPTIONS` preflight for CORS.
+
+No response-side limit/pagination is applied — matches this repo's existing
+"fine at prototype scale" philosophy (e.g. `incubator-latest-reading`'s
+full-scan fallback) — worth revisiting if a chronically-alerting device
+accumulates enough rows to make the response slow or large.
+
 ### `incubator-latest-reading`
 **Trigger:** API Gateway HTTP `GET` (proxy integration), optional
 `{device_id}` path parameter.
@@ -450,6 +476,18 @@ plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — same EventBridge
 invoke-permission note as `incubator-light-average-alert` above applies here
 too.
 
+`incubator-alerts-get`'s execution role includes the inline policy
+`ReadIncubatorAlerts`, granting:
+- `dynamodb:Query` on `incubator_alerts`
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role, this
+is API-Gateway-triggered like `incubator-settings-get`/`-post` and
+`incubator-latest-reading`. Its API Gateway `GET` method (not the Lambda
+itself) is additionally gated by the Cognito authorizer shared with
+`POST /settings` — the Lambda code performs no token validation of its own,
+consistent with how `incubator-settings-post` also trusts API Gateway to
+reject unauthorized requests before invocation.
+
 ---
 
 ## Migration Notes
@@ -529,3 +567,5 @@ in the Lambda console's "Test" tab:
 | `incubator-light-rollup/test-event-rollup.json` | incubator-light-rollup | one clean measurement → hourly bucket incremented |
 | `incubator-light-average-alert/test-event-scheduled.json` | incubator-light-average-alert | simulated hourly EventBridge tick |
 | `incubator-measurements-rejected-alert/test-event-scheduled.json` | incubator-measurements-rejected-alert | simulated hourly EventBridge tick |
+| `incubator-alerts-get/test-event-existing-device.json` | incubator-alerts-get | fetch alerts for a device with rows |
+| `incubator-alerts-get/test-event-unknown-device.json` | incubator-alerts-get | fetch alerts for a device with none → `[]` |
