@@ -33,7 +33,7 @@ incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gat
                                                                /sensor/latest/{device_id})
 incubator_measurement_clean   ----> incubator-measurements-range (HTTP GET, API Gateway,
                                                                    /sensor/measurements/{device_id}
-                                                                   ?range=1h|24h|7d)
+                                                                   ?range=1h|2h|24h|7d)
 incubator_alerts (DynamoDB)   ----> incubator-alerts-get     (HTTP GET,  API Gateway,
                                                                Cognito-authorized)
 
@@ -366,8 +366,8 @@ fields are now real JSON numbers.
 `/sensor/measurements/{device_id}` — a sibling resource under the same
 `/sensor` path as `incubator-latest-reading`'s `/sensor/latest/{device_id}`,
 rather than its own top-level resource. Expects `{device_id}` as a path
-parameter and an optional `range` query-string parameter (`1h`, `24h`, or
-`7d`; defaults to `24h`, `400` on any other value).
+parameter and an optional `range` query-string parameter (`1h`, `2h`, `24h`,
+or `7d`; defaults to `24h`, `400` on any other value).
 **Files:** `lambda_function.py`, `config.py`, `repository.py`,
 `downsampler.py`, `response_utils.py`
 
@@ -378,8 +378,10 @@ Computes `start`/`end` epoch bounds from the requested range, then queries
 paginating on `LastEvaluatedKey` (bounded to one partition/time window, not
 a full scan).
 
-If the query returns more than `MAX_POINTS` (500) items, `downsampler.py`
-buckets them into `MAX_POINTS` evenly-sized time windows
+If the query returns more than `MAX_POINTS` (750 — chosen so the "last 2
+hours" range stays at full ~10s-per-reading resolution, since the incubator
+reports roughly every 10s and 2h × 6/min = ~720 readings) items,
+`downsampler.py` buckets them into `MAX_POINTS` evenly-sized time windows
 (`bucket_width = (end - start) / MAX_POINTS`, same flooring idea as
 `incubator-light-rollup`'s `hour_bucket`) and averages every numeric field
 per bucket — including the 0/1 actuator fields (`relay_state_1-4`,
@@ -670,6 +672,7 @@ in the Lambda console's "Test" tab:
 | `incubator-alerts-get/test-event-existing-device.json` | incubator-alerts-get | fetch alerts for a device with rows |
 | `incubator-alerts-get/test-event-unknown-device.json` | incubator-alerts-get | fetch alerts for a device with none → `[]` |
 | `incubator-measurements-range/test-event-last-hour.json` | incubator-measurements-range | `range=1h`, typically raw/undownsampled |
+| `incubator-measurements-range/test-event-last-2h.json` | incubator-measurements-range | `range=2h`, typically raw/undownsampled |
 | `incubator-measurements-range/test-event-last-24h.json` | incubator-measurements-range | `range=24h` |
 | `incubator-measurements-range/test-event-last-7d.json` | incubator-measurements-range | `range=7d`, typically triggers downsampling |
 | `incubator-measurements-range/test-event-unknown-device.json` | incubator-measurements-range | device with no data → `[]` |
