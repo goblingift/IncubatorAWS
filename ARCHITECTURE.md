@@ -34,6 +34,8 @@ incubator_measurement_clean   ----> incubator-latest-reading (HTTP GET,  API Gat
 incubator_measurement_clean   ----> incubator-measurements-range (HTTP GET, API Gateway,
                                                                    /sensor/measurements/{device_id}
                                                                    ?range=1h|2h|24h|7d)
+incubator_measurement_clean   ----> incubator-battery-status (HTTP GET,  API Gateway,
+                                                               /sensor/battery/{device_id})
 incubator_alerts (DynamoDB)   ----> incubator-alerts-get     (HTTP GET,  API Gateway,
                                                                Cognito-authorized)
 
@@ -74,8 +76,9 @@ one Lambda, or moving to Kinesis Data Streams for DynamoDB).
 There are three triggers into this system:
 - **DynamoDB Streams**, for the automatic cleaning/alerting/rollup pipeline.
 - **API Gateway (HTTP)**, for reading/writing device settings, querying the
-  latest measurement, and browsing a device's alert history, presumably used
-  by a frontend/dashboard.
+  latest measurement or a historical range, browsing a device's alert
+  history, and projecting remaining battery runtime — presumably used by a
+  frontend/dashboard.
 - **EventBridge (scheduled)**, for the hourly rolling-average light check and
   the hourly rejected-measurements check.
 
@@ -396,6 +399,83 @@ get`, this endpoint is **not** behind the Cognito authorizer — it's public,
 matching `incubator-latest-reading` and the fact it backs the (unprotected)
 Dashboard page.
 
+### `incubator-battery-status`
+**Trigger:** API Gateway HTTP `GET` (proxy integration) at
+`/sensor/battery/{device_id}` — a sibling resource under the same `/sensor`
+path as `incubator-latest-reading`'s `/sensor/latest/{device_id}` and
+`incubator-measurements-range`'s `/sensor/measurements/{device_id}`. Expects
+`{device_id}` as a path parameter; takes no query-string parameters (the
+lookback window is fixed at 60 minutes, not user-selectable like `range` on
+`-measurements-range`).
+**Files:** `lambda_function.py`, `config.py`, `repository.py`, `curve.py`,
+`regression.py`, `response_utils.py`
+
+Predicts remaining incubator runtime on battery power:
+1. Queries `incubator_measurement_clean` for the last 60 minutes of
+   `(timestamp, voltage, relay_state_3)` (`Key("device_id").eq(device_id) &
+   Key("timestamp").between(start, end)`, `ScanIndexForward=True`, paginated
+   on `LastEvaluatedKey` — same bounded single-partition shape as
+   `-measurements-range`, with a `ProjectionExpression` added since only 3 of
+   the ~17 clean-table fields are needed; its `#ts` alias is required because
+   `ProjectionExpression`, unlike `KeyConditionExpression`'s `Key()` helper,
+   doesn't auto-escape reserved words, and `timestamp` is one).
+2. For each reading, picks a discharge curve — `IDLE_CURVE` or `HEATER_CURVE`
+   in `config.py` — based on that reading's own `relay_state_3` (the heater
+   relay channel, per firmware's `RELAY_CH_HEATER`), defaulting to
+   `IDLE_CURVE` when `relay_state_3` is `0`, `None`, or absent entirely (older
+   rows predating the `actuator_state` migration have no relay fields at
+   all — see Migration Notes).
+3. Linearly interpolates voltage against the chosen curve
+   (`curve.interpolate_percent`), clamping to 100%/0% outside the curve's
+   endpoints rather than rejecting the reading.
+4. Fits an ordinary-least-squares line (`regression.linear_regression`, plain
+   Python, no numpy — same precedent as `incubator-light-average-alert`'s
+   arithmetic) over the resulting `(timestamp, percent)` series. Timestamps
+   are re-centered on the window's first reading before fitting purely for
+   float precision: epoch-second timestamps are ~1.75×10⁹-scale, so squaring
+   them in the textbook slope formula subtracts two ~10²³-scale sums to
+   recover a signal many orders of magnitude smaller — a classic
+   catastrophic-cancellation trap. Centering keeps every value under ~3600
+   and sidesteps it; slope is translation-invariant, so the answer is
+   unchanged, only its numerical safety.
+5. Slope is negated and converted to percent/hour so a positive number
+   always means "draining."
+6. If the drain rate is at or below `MIN_DRAIN_RATE_PERCENT_PER_HOUR`
+   (config, default `0.1` — avoids a razor-thin positive slope from
+   measurement noise producing an absurd "312 days remaining"), the battery
+   is reported `"stable_or_charging"` and `remaining_hours`/
+   `predicted_shutdown_at` are `null`.
+7. Otherwise `remaining_hours = current_percent / drain_rate_percent_per_hour`
+   and `predicted_shutdown_at = now + remaining_hours` (epoch seconds,
+   matching every other timestamp in this pipeline).
+
+`current_percent`/`current_voltage` come from the single most recent reading
+in the window (same "just return the latest row" philosophy as
+`incubator-latest-reading`), not the regression line's fitted value at "now".
+
+Graceful degradation, matching this repo's "never 500 for 'no data yet'"
+convention: zero readings in the window → `200`, `"status": "no_data"`; one
+reading, or readings that all share a single timestamp (degenerate
+regression) → `200`, `"status": "insufficient_data"`, current
+voltage/percent still reported, drain-rate fields `null`; otherwise
+`"status": "draining"` with every field populated.
+
+**Curve data is a placeholder.** The real voltage→percent discharge curves
+(two 101-point tables, idle and heater-active) haven't been delivered yet;
+`IDLE_CURVE`/`HEATER_CURVE` are generated by a straight line between
+`incubator_settings`'s `voltage_min`/`voltage_max` defaults (11V/13V idle,
+10.6V/12.6V heater-active, guessing a lower sag range), not a measured
+curve, and `CURVE_CALIBRATED = False` is threaded into every response as
+`"curve_calibrated": false` so nobody mistakes early numbers for calibrated
+ones. Swap-in: replace the two generated constants with literal
+`(voltage, percent)` lists and flip the flag — no other file changes.
+
+Public — not behind the Cognito authorizer. Sensor-derived operational
+status, the same class of data as `incubator-latest-reading`/
+`incubator-measurements-range` (both public); Cognito-gating in this
+pipeline is reserved specifically for alert history
+(`incubator-alerts-get`).
+
 ### `incubator-threshold-alert`
 **Trigger:** DynamoDB Stream on `incubator_measurement_clean` (`INSERT`/
 `MODIFY` events; `REMOVE` is skipped since it has no `NewImage` to check).
@@ -580,6 +660,14 @@ plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role
 (API-Gateway-triggered). Its `GET` method has Authorization set to NONE,
 same as `incubator-latest-reading`.
 
+`incubator-battery-status`'s execution role includes the inline policy
+`ReadIncubatorMeasurementsForBattery`, granting:
+- `dynamodb:Query` on `incubator_measurement_clean`
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role
+(API-Gateway-triggered). Its `GET` method has Authorization set to NONE,
+same as `incubator-latest-reading`/`incubator-measurements-range`.
+
 ---
 
 ## Migration Notes
@@ -676,3 +764,5 @@ in the Lambda console's "Test" tab:
 | `incubator-measurements-range/test-event-last-24h.json` | incubator-measurements-range | `range=24h` |
 | `incubator-measurements-range/test-event-last-7d.json` | incubator-measurements-range | `range=7d`, typically triggers downsampling |
 | `incubator-measurements-range/test-event-unknown-device.json` | incubator-measurements-range | device with no data → `[]` |
+| `incubator-battery-status/test-event-existing-device.json` | incubator-battery-status | fetch battery status for a device with recent readings |
+| `incubator-battery-status/test-event-unknown-device.json` | incubator-battery-status | fetch battery status for a device with no recent readings → `no_data` |
