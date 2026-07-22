@@ -11,6 +11,29 @@ from response_utils import response
 
 SECONDS_PER_HOUR = 3600
 
+def _relay_state(item):
+    return int(item.get("relay_state_3") or 0)
+
+def _trailing_same_state_segment(readings):
+    """Walk backward from the most recent reading and keep only the
+    contiguous run sharing its relay_state_3. A heater on/off transition
+    within the window switches which discharge curve applies, and the two
+    curves aren't perfectly reconciled against each other - regressing
+    across that switch reads the resulting voltage/percent jump as a
+    drain-rate trend that isn't really there (e.g. the heater turning off
+    looks like charging). Restricting to the same-state tail avoids it, at
+    the cost of a shorter series (or none at all) right after a transition."""
+    if not readings:
+        return []
+    current_state = _relay_state(readings[-1])
+    segment = []
+    for item in reversed(readings):
+        if _relay_state(item) != current_state:
+            break
+        segment.append(item)
+    segment.reverse()
+    return segment
+
 def lambda_handler(event, context):
     if event.get("httpMethod") == "OPTIONS":
         return response(200, {"message": "ok"})
@@ -33,10 +56,6 @@ def lambda_handler(event, context):
                 "curve_calibrated": CURVE_CALIBRATED,
             })
 
-        percent_series = [
-            (int(item["timestamp"]), percent_for_reading(item, IDLE_CURVE, HEATER_CURVE))
-            for item in readings
-        ]
         latest_item = readings[-1]
         current_percent = percent_for_reading(latest_item, IDLE_CURVE, HEATER_CURVE)
 
@@ -45,9 +64,18 @@ def lambda_handler(event, context):
             "timestamp": int(latest_item["timestamp"]),
             "battery_voltage": float(latest_item["voltage"]),
             "battery_percent": round(current_percent, 2),
-            "sample_count": len(percent_series),
+            "heater_active": _relay_state(latest_item) == 1,
             "curve_calibrated": CURVE_CALIBRATED,
         }
+
+        # Regress only over the trailing same-heater-state segment, not the
+        # whole window - see _trailing_same_state_segment for why.
+        segment = _trailing_same_state_segment(readings)
+        percent_series = [
+            (int(item["timestamp"]), percent_for_reading(item, IDLE_CURVE, HEATER_CURVE))
+            for item in segment
+        ]
+        base["sample_count"] = len(percent_series)
 
         try:
             slope_per_second, _ = linear_regression(percent_series)
@@ -55,8 +83,9 @@ def lambda_handler(event, context):
             return response(200, {
                 **base,
                 "status": "insufficient_data",
-                "message": f"Need >=2 readings at different timestamps in the last "
-                           f"{WINDOW_SECONDS // 60} minutes to estimate a drain rate",
+                "message": "Need >=2 readings at different timestamps with an unchanged "
+                           "heater state to estimate a drain rate (heater state may have "
+                           "just changed)",
                 "drain_rate_percent_per_hour": None,
                 "remaining_hours": None,
                 "predicted_shutdown_at": None,
