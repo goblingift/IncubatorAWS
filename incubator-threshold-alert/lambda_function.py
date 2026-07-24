@@ -1,8 +1,11 @@
 import logging
 import time
 import uuid
+from decimal import Decimal
 
 from checker import ThresholdChecker
+from config import IDLE_CURVE, HEATER_CURVE
+from curve import percent_for_reading
 from repository import ThresholdRepository
 
 logger = logging.getLogger()
@@ -25,6 +28,18 @@ def lambda_handler(event, context):
             device_id = measurement.get("device_id")
             if not device_id:
                 continue
+
+            # Synthetic field, not written by lambda-cleanup-measurements:
+            # derived from voltage (+ relay_state_3 for heater-load curve
+            # selection) via the same discharge-curve interpolation as
+            # incubator-battery-status, so ThresholdChecker can compare it
+            # against battery_percent_min like any other measurement field.
+            # Must be Decimal, not the native float curve.py returns -
+            # DynamoDB's put_item rejects native floats.
+            if measurement.get("voltage") is not None:
+                measurement["battery_percent"] = Decimal(
+                    str(round(percent_for_reading(measurement, IDLE_CURVE, HEATER_CURVE), 2))
+                )
 
             settings = ThresholdRepository.get_settings(device_id)
             if not settings:

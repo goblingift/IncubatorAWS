@@ -45,12 +45,12 @@ flowchart TD
     CleanTable -- DynamoDB Stream: INSERT (2nd consumer) --> RollupLambda[incubator-light-rollup]
     RollupLambda --> HourlyTable[(incubator_light_hourly)]
 
-    subgraph Light Rolling Average
+    subgraph Light Sleep-Friendly Hours
         direction TB
         Schedule([EventBridge: hourly]) --> AvgLambda[incubator-light-average-alert]
-        AvgLambda --> HasLightSettings{Devices with\nlight_avg_max?}
-        HasLightSettings -- yes --> QueryHourly[Sum last 24h of buckets]
-        QueryHourly --> AvgViolation{Average >\nlight_avg_max?}
+        AvgLambda --> HasLightSettings{Devices with light_sleep_max\nand light_sleep_min_hours?}
+        HasLightSettings -- yes --> QueryHourly[Count sleep-friendly hours\nin last 24h of buckets]
+        QueryHourly --> AvgViolation{Sleep-friendly hours <\nlight_sleep_min_hours?}
         AvgViolation -- yes --> WriteAvgAlert[(incubator_alerts)]
         AvgViolation -- yes --> PublishAvgSns[[SNS: incubator-measurement-\noutside-allowed-range]]
     end

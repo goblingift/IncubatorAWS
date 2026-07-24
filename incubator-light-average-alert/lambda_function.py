@@ -1,10 +1,9 @@
 import logging
 import time
 import uuid
-from decimal import Decimal
 
 from config import HOUR_SECONDS, LOOKBACK_HOURS
-from repository import LightAverageRepository
+from repository import LightSleepRepository
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -14,42 +13,52 @@ def lambda_handler(event, context):
     current_hour_bucket = now // HOUR_SECONDS * HOUR_SECONDS
     start_bucket = current_hour_bucket - (LOOKBACK_HOURS - 1) * HOUR_SECONDS
 
-    for device in LightAverageRepository.get_devices_with_light_avg_max():
+    for device in LightSleepRepository.get_devices_with_light_sleep_settings():
         device_id = device.get("device_id")
-        light_avg_max = device.get("light_avg_max")
-        if not device_id or light_avg_max is None:
+        light_sleep_max = device.get("light_sleep_max")
+        light_sleep_min_hours = device.get("light_sleep_min_hours")
+        if not device_id or light_sleep_max is None or light_sleep_min_hours is None:
             continue
 
         try:
-            buckets = LightAverageRepository.get_hourly_buckets(device_id, start_bucket, current_hour_bucket)
+            buckets = LightSleepRepository.get_hourly_buckets(device_id, start_bucket, current_hour_bucket)
 
-            total_sum = sum((b.get("light_sum", 0) for b in buckets), Decimal(0))
             total_count = sum(b.get("reading_count", 0) for b in buckets)
-
             if total_count == 0:
-                continue  # no data in window (e.g. device offline) - no false alert
+                continue  # no data at all in the window (e.g. device offline) - no false alert
 
-            average = total_sum / total_count
+            # A missing hour_bucket row (no readings that hour) is silently
+            # excluded from this count: incubator-light-rollup only ever
+            # creates a row via ADD light_sum, reading_count together, so
+            # there's no such thing as a row with reading_count 0. A
+            # reporting gap therefore can't masquerade as evidence of
+            # darkness.
+            sleep_friendly_hours = sum(
+                1 for b in buckets
+                if b.get("reading_count", 0) > 0
+                and (b.get("light_sum", 0) / b.get("reading_count", 1)) <= light_sleep_max
+            )
 
-            if average > light_avg_max:
-                LightAverageRepository.save_alert({
+            if sleep_friendly_hours < light_sleep_min_hours:
+                LightSleepRepository.save_alert({
                     "device_id": device_id,
                     "alert_id": str(uuid.uuid4()),
                     "timestamp": current_hour_bucket,
                     "checked_at": now,
-                    "field": "light_intensity_avg_24h",
-                    "value": average,
-                    "bound": "max",
-                    "threshold": light_avg_max,
+                    "field": "light_sleep_hours_24h",
+                    "value": sleep_friendly_hours,
+                    "bound": "min",
+                    "threshold": light_sleep_min_hours,
                 })
-                LightAverageRepository.publish_alert(
-                    subject=f"Incubator alert: {device_id} light_intensity_avg_24h out of range",
+                LightSleepRepository.publish_alert(
+                    subject=f"Incubator alert: {device_id} light_sleep_hours_24h out of range",
                     message=(
-                        f"Device {device_id} reported a 24h average light intensity of {average}, "
-                        f"which is above the configured max threshold of {light_avg_max}."
+                        f"Device {device_id} had only {sleep_friendly_hours} sleep-friendly hour(s) "
+                        f"(hourly avg. light intensity <= {light_sleep_max} lux) out of the last "
+                        f"{LOOKBACK_HOURS}h, below the configured minimum of {light_sleep_min_hours}."
                     ),
                 )
         except Exception:
-            logger.exception("Failed to evaluate light average for device %s", device_id)
+            logger.exception("Failed to evaluate light sleep hours for device %s", device_id)
 
     return {"statusCode": 200}

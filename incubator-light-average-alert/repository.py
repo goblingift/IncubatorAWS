@@ -8,13 +8,13 @@ settings_table = dynamodb.Table(SETTINGS_TABLE_NAME)
 hourly_table = dynamodb.Table(HOURLY_TABLE_NAME)
 alerts_table = dynamodb.Table(ALERTS_TABLE_NAME)
 
-class LightAverageRepository:
+class LightSleepRepository:
     @staticmethod
-    def get_devices_with_light_avg_max():
+    def get_devices_with_light_sleep_settings():
         items = []
         scan_kwargs = {
-            "FilterExpression": Attr("light_avg_max").exists(),
-            "ProjectionExpression": "device_id, light_avg_max",
+            "FilterExpression": Attr("light_sleep_max").exists() & Attr("light_sleep_min_hours").exists(),
+            "ProjectionExpression": "device_id, light_sleep_max, light_sleep_min_hours",
         }
         while True:
             result = settings_table.scan(**scan_kwargs)

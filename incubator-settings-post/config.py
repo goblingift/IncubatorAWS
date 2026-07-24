@@ -8,7 +8,8 @@ NUMERIC_FIELDS = [
     "humidity_min",
     "humidity_max",
     "co2_max",
-    "light_avg_max",
+    "light_sleep_max",
+    "light_sleep_min_hours",
     "pitch_deg_max",
     "roll_deg_max",
     "sound_max",
@@ -19,5 +20,6 @@ NUMERIC_FIELDS = [
     "current_min",
     "current_max",
     "water_level_min",
-    "water_level_max"
+    "water_level_max",
+    "battery_percent_min"
 ]

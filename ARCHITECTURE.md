@@ -55,7 +55,19 @@ incubator-light-rollup  ---->  incubator_light_hourly (TTL'd hourly buckets)
 
 incubator_settings ----> incubator-light-average-alert (scanned each run for
                                                           devices with
-                                                          light_avg_max set)
+                                                          light_sleep_max and
+                                                          light_sleep_min_hours set)
+
+incubator_light_hourly ----> incubator-light-average-status (HTTP GET, API Gateway,
+                                                               /sensor/light-average/{device_id})
+incubator_settings     ----> incubator-light-average-status (GetItem per device, for its
+                                                               light_sleep_max/min_hours)
+
+Note: incubator-light-average-alert/-status, their EventBridge rule
+(incubator-light-average-hourly), and the /sensor/light-average route all
+predate the "sleep-friendly hours" redesign (see Migration Notes) — their
+names are now partial misnomers, kept as-is deliberately rather than
+recreating deployed AWS resources for a cosmetic rename.
 
 incubator_measurement_rejected
      |  (scanned on an hourly EventBridge schedule)
@@ -197,7 +209,8 @@ Per-device configuration of alert thresholds, written via
 | `temperature_min`, `temperature_max` | `temperature_celsius` |
 | `humidity_min`, `humidity_max` | `humidity_rh` |
 | `co2_max` | `co2_ppm` |
-| `light_avg_max` | `light_intensity` (checked as a rolling 24h average, not per-reading — see `incubator-light-average-alert`) |
+| `light_sleep_max` | `light_intensity` (max hourly-average lux for an hour to count as "sleep-friendly" — see `incubator-light-average-alert`) |
+| `light_sleep_min_hours` | derived: count of sleep-friendly hours in the last 24h (not a raw measurement field — see `incubator-light-average-alert`) |
 | `sound_max` | `sound_intensity` |
 | `weight_min`, `weight_max` | `weight_gram` |
 | `pitch_deg_max` | `pitch_deg` (checked against absolute value) |
@@ -205,6 +218,7 @@ Per-device configuration of alert thresholds, written via
 | `voltage_min`, `voltage_max` | `voltage` |
 | `current_min`, `current_max` | `current` |
 | `water_level_min`, `water_level_max` | `water_level` |
+| `battery_percent_min` | `battery_percent` (computed via discharge-curve interpolation over the current measurement's voltage — not a raw measurement field; see `incubator-threshold-alert`) |
 
 Plus `device_id` and `updated_at` (ISO-8601 timestamp of last update).
 
@@ -234,6 +248,24 @@ measurements.
 > the stale `light_max` key is dropped automatically the next time that
 > device's settings are re-submitted.
 
+> **Note (historical):** this table previously had `light_avg_max`, a
+> threshold on the rolling 24-hour *average* of `light_intensity`. It was
+> replaced with `light_sleep_max` + `light_sleep_min_hours`, since an average
+> doesn't answer the question that actually matters — whether the incubator
+> got enough dark, sleep-friendly time in a day — a device lit brightly for 2
+> hours and dark for 22 could still average low enough to pass, and vice
+> versa. `light_sleep_max` now defines what counts as a sleep-friendly hour
+> (that hour's own average <= this value), and `light_sleep_min_hours` is the
+> minimum required count of such hours per 24h — see `incubator-light-
+> average-alert`. Existing rows written before this change will have
+> `light_avg_max` but not the two new fields; since `incubator-settings-post`
+> overwrites the whole item via `put_item`, the stale key is dropped
+> automatically the next time that device's settings are re-submitted — but
+> until then, `incubator-light-average-alert`'s scan (which now requires
+> *both* new fields to exist) simply won't match that device, meaning it
+> silently stops being checked for light at all. See Migration Notes for the
+> deploy-order recommendation this implies.
+
 ### `incubator_light_hourly`
 - **Partition key:** `device_id` (String)
 - **Sort key:** `hour_bucket` (Number, epoch seconds floored to the start of
@@ -256,6 +288,12 @@ rather than the bare words `sum`/`count`, since those are DynamoDB reserved
 words in expression syntax; DynamoDB's reserved-word check is whole-token
 (not substring), so compound names like these are unaffected — the same way
 this schema already uses `timestamp` (itself reserved) safely elsewhere.
+
+Also read on-demand by `incubator-light-average-status` (HTTP GET), which
+exposes the same rolling 24h average `light_intensity` that
+`incubator-light-average-alert` computes hourly for alerting — same query,
+same math, different trigger/cadence, so the dashboard can show a live
+number instead of the alert's frozen-at-the-hour value.
 
 ### `incubator_alerts`
 - **Partition key:** `device_id` (String)
@@ -497,18 +535,36 @@ pipeline is reserved specifically for alert history
 ### `incubator-threshold-alert`
 **Trigger:** DynamoDB Stream on `incubator_measurement_clean` (`INSERT`/
 `MODIFY` events; `REMOVE` is skipped since it has no `NewImage` to check).
-**Files:** `lambda_function.py`, `config.py`, `checker.py`, `repository.py`
+**Files:** `lambda_function.py`, `config.py`, `checker.py`, `repository.py`,
+`curve.py`
 
 For each new clean measurement:
 1. Skips anything not `cleaning_status: "clean"` (defensive; rejected items
    live in a different table anyway).
-2. Looks up that device's row in `incubator_settings`. If none exists, the
+2. If the measurement has a `voltage` field, computes a synthetic
+   `battery_percent` field via the same discharge-curve interpolation as
+   `incubator-battery-status` (`curve.py`, `IDLE_CURVE`/`HEATER_CURVE`
+   duplicated verbatim — no shared Lambda layer in this repo; if the curves
+   are ever re-measured, update both files together, nothing enforces them
+   staying in sync), selecting the idle or heater-load curve by the
+   measurement's own `relay_state_3`. Because this runs per-measurement via
+   the stream (not a periodic scan), battery alerts fire as fast as any
+   other threshold check — within seconds of the device reporting — unlike
+   `incubator-light-average-alert`'s hourly cadence. Wrapped in
+   `Decimal(str(round(..., 2)))` before being added to the measurement dict:
+   `curve.py`'s interpolation returns a native Python `float`, and on a
+   violation this value flows straight into `incubator_alerts` via
+   `put_item`, which rejects native floats (`TypeError: Float types are not
+   supported` — same class of bug `lambda-cleanup-measurements`'
+   `to_dynamo_compatible` exists to prevent elsewhere in this pipeline).
+3. Looks up that device's row in `incubator_settings`. If none exists, the
    record is skipped entirely (no thresholds to check against).
-3. `ThresholdChecker.check` compares each measurement field present against
-   its corresponding min/max threshold field(s) from `THRESHOLD_FIELDS` in
+4. `ThresholdChecker.check` compares each measurement field present
+   (including the synthetic `battery_percent`, if computed) against its
+   corresponding min/max threshold field(s) from `THRESHOLD_FIELDS` in
    `config.py`. `pitch_deg`/`roll_deg` are compared by absolute value against
    a single max (symmetric tilt tolerance).
-4. For every violation found:
+5. For every violation found:
    - writes a row to `incubator_alerts`
    - publishes a message to the SNS topic
      `incubator-measurement-outside-allowed-range`, with a human-readable
@@ -516,6 +572,13 @@ For each new clean measurement:
      threshold.
 
 Same partial-batch-failure pattern as the cleanup Lambda.
+
+Note: `voltage_min` (default 11V) already fires on low voltage independent of
+`battery_percent_min` — a real low-battery event will likely trip both checks
+and send two separate notifications for what's conceptually one event, since
+`voltage_min` is a flat cutoff regardless of heater-load state while
+`battery_percent_min` is load-aware. Not addressed; revisit if the double
+notification becomes annoying.
 
 ### `incubator-light-rollup`
 **Trigger:** DynamoDB Stream on `incubator_measurement_clean` — this is the
@@ -540,23 +603,36 @@ Same partial-batch-failure pattern as the other stream Lambdas.
 
 ### `incubator-light-average-alert`
 **Trigger:** EventBridge scheduled rule, hourly (`cron(0 * * * ? *)`) — the
-first use of EventBridge in this repo.
+first use of EventBridge in this repo. **Note:** this Lambda's name (and its
+EventBridge rule, `incubator-light-average-hourly`) predates the
+"sleep-friendly hours" redesign below and is now a partial misnomer — kept
+as-is rather than recreating a deployed AWS resource for a cosmetic rename
+(see Migration Notes).
 **Files:** `lambda_function.py`, `config.py`, `repository.py`
 
 Once per hour:
-1. Scans `incubator_settings` for devices with a `light_avg_max` configured
-   (small table, few devices — same "fine at prototype scale" justification
-   as `incubator-latest-reading`'s full-table-scan fallback).
+1. Scans `incubator_settings` for devices with **both** `light_sleep_max`
+   and `light_sleep_min_hours` configured (small table, few devices — same
+   "fine at prototype scale" justification as `incubator-latest-reading`'s
+   full-table-scan fallback).
 2. For each such device, queries `incubator_light_hourly` for the current
-   hour bucket plus the previous 23 (~24h trailing window, hour-granularity
-   rather than a true second-level sliding window — acceptable since a
-   24-hour average doesn't need sub-hour precision), sums `light_sum` and
-   `reading_count` across the returned buckets, and computes the average.
-3. Skips the device if no readings were found in that window (e.g. device
-   offline) — no false alert, same "skip when data is absent" philosophy as
-   `incubator-threshold-alert` skipping devices with no settings row.
-4. If the average exceeds `light_avg_max`: writes a row to
-   `incubator_alerts` (`field: "light_intensity_avg_24h"`, `timestamp` set
+   hour bucket plus the previous 23 (~24h trailing window).
+3. Skips the device entirely if **no readings at all** were found in that
+   window (e.g. device offline) — no false alert, same "skip when data is
+   absent" philosophy as `incubator-threshold-alert` skipping devices with no
+   settings row. This whole-window guard is distinct from a single missing
+   hour within an otherwise-reporting window — see next step.
+4. Counts how many of the returned hour buckets are "sleep-friendly": an
+   hour qualifies if that hour's own average (`light_sum / reading_count`)
+   is `<= light_sleep_max`. An hour with no readings at all has no bucket
+   row to begin with (`incubator-light-rollup`'s `add_reading` only ever
+   creates a row via `ADD light_sum, reading_count` together — there's no
+   code path that writes `reading_count: 0`), so a reporting gap is silently
+   excluded from the count rather than needing special-case handling — a gap
+   can't masquerade as evidence of darkness.
+5. If the resulting count is below `light_sleep_min_hours`: writes a row to
+   `incubator_alerts` (`field: "light_sleep_hours_24h"`, `value`: the actual
+   count, `bound: "min"`, `threshold: light_sleep_min_hours`, `timestamp` set
    to the current hour bucket rather than a single offending measurement's
    timestamp, since this is an aggregate check, not a per-measurement one)
    and publishes to the same SNS topic as `incubator-threshold-alert`, same
@@ -564,6 +640,53 @@ Once per hour:
 
 Unlike `incubator-threshold-alert`, this can raise at most one alert per
 device per hour, rather than one per violating measurement.
+
+### `incubator-light-average-status`
+**Trigger:** API Gateway HTTP `GET` (proxy integration) at
+`/sensor/light-average/{device_id}` — a sibling resource under the same
+`/sensor` path as `incubator-latest-reading`/`incubator-measurements-range`/
+`incubator-battery-status`. Expects `{device_id}` as a path parameter.
+**Note:** same naming caveat as `incubator-light-average-alert` above — the
+Lambda name and route path predate this redesign.
+**Files:** `lambda_function.py`, `config.py`, `repository.py`,
+`response_utils.py`
+
+Exposes the same "sleep-friendly hours" count that
+`incubator-light-average-alert` computes hourly for alerting, but on-demand
+for the dashboard. Fetches the device's `light_sleep_max`/
+`light_sleep_min_hours` via `GetItem` on `incubator_settings` (a **new**
+access this Lambda didn't previously need — computing the count requires
+knowing the device's threshold) — falling back to
+`DEFAULT_LIGHT_SLEEP_MAX`/`DEFAULT_LIGHT_SLEEP_MIN_HOURS` in `config.py`
+(duplicated from `incubator-settings-get`'s `DEFAULT_SETTINGS` — same
+duplication-across-files precedent as the battery discharge curves; update
+both together if the defaults ever change) if the device has no settings row
+yet, or one predating this feature. Then queries `incubator_light_hourly`
+for the current hour bucket plus the previous 23 (identical window/query
+shape to `incubator-light-average-alert`) and counts sleep-friendly hours
+the same way — deliberately the same logic, so the number shown on the
+dashboard is the same one the hourly alert check acts on, modulo cadence:
+this Lambda recomputes fresh on every request against current data, while
+the alert Lambda only recomputes once an hour, so the two can diverge
+between alert evaluations by design, not by bug (the dashboard should show a
+live number; the alert's decision was frozen at the top of its hour).
+
+Returns `{"device_id", "status": "ok", "sleep_friendly_hours",
+"light_sleep_min_hours", "light_sleep_max", "passing", "sample_count",
+"bucket_count"}` on success, where `passing = sleep_friendly_hours >=
+light_sleep_min_hours`. If no light readings at all exist in the 24h window
+(new device, or one that stopped reporting more than `incubator_light_hourly`'s
+~48h TTL ago), returns `{"device_id", "status": "no_data", "message",
+"sleep_friendly_hours": null, "light_sleep_min_hours", "light_sleep_max",
+"passing": null, "sample_count": 0, "bucket_count"}` instead of an error —
+this `no_data` status is reserved specifically for "no data to compute
+from," distinct from "no configured threshold" (which has a default
+fallback, not an error). Handles `OPTIONS` preflight for CORS; `500` on
+unexpected errors.
+
+Public — not behind the Cognito authorizer, same reasoning as
+`incubator-battery-status`: sensor-derived operational data, not alert
+history.
 
 ### `incubator-measurements-rejected-alert`
 **Trigger:** EventBridge scheduled rule, hourly (`cron(0 * * * ? *)`).
@@ -625,7 +748,10 @@ policy `AccessDynamoDBSettingsAndPublishSNS`, which must grant:
 - `sns:Publish` on the `incubator-measurement-outside-allowed-range` topic
 
 plus the AWS-managed `AWSLambdaDynamoDBExecutionRole` (stream read access) and
-`AWSLambdaBasicExecutionRole` (CloudWatch Logs).
+`AWSLambdaBasicExecutionRole` (CloudWatch Logs). No new permissions were
+needed to add the `battery_percent` check above — it works entirely from the
+measurement already delivered via the stream event and doesn't query
+`incubator_measurement_clean` itself.
 
 `incubator-light-rollup`'s execution role includes the inline policy
 `AccessLightHourlyRollup`, granting:
@@ -640,6 +766,10 @@ plus `AWSLambdaDynamoDBExecutionRole` (stream read access) and
 - `dynamodb:Query` on `incubator_light_hourly`
 - `dynamodb:PutItem` on `incubator_alerts`
 - `sns:Publish` on the `incubator-measurement-outside-allowed-range` topic
+
+(Unchanged by the "sleep-friendly hours" redesign — same four operations,
+just a different settings field name in the scan filter and a different
+alert `field` value; no policy edit needed.)
 
 plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — **not**
 `AWSLambdaDynamoDBExecutionRole`, since this Lambda is EventBridge-triggered,
@@ -685,6 +815,21 @@ same as `incubator-latest-reading`.
 plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role
 (API-Gateway-triggered). Its `GET` method has Authorization set to NONE,
 same as `incubator-latest-reading`/`incubator-measurements-range`.
+
+`incubator-light-average-status`'s execution role includes the inline
+policy `ReadIncubatorLightHourly`, granting:
+- `dynamodb:Query` on `incubator_light_hourly`
+- `dynamodb:GetItem` on `incubator_settings` (added for the "sleep-friendly
+  hours" redesign — this endpoint now needs the device's `light_sleep_max`/
+  `light_sleep_min_hours` to compute the count; it didn't need any settings
+  access before)
+
+plus `AWSLambdaBasicExecutionRole` (CloudWatch Logs) — no stream role
+(API-Gateway-triggered). Its `GET` method has Authorization set to NONE,
+same as the other public sensor-data read Lambdas. Still narrower than
+`incubator-light-average-alert`'s role: `GetItem` only (not `Scan`) on
+`incubator_settings`, and still no `incubator_alerts`/SNS access (it never
+writes an alert, only reads).
 
 ---
 
@@ -757,6 +902,47 @@ after this change will have the 5 new keys and will not have `relay_state`.
 |---|---|
 | `light_max` (instant per-reading cap) | `light_avg_max` (24h rolling average threshold, checked hourly) |
 
+`light_avg_max` (24h rolling average threshold) was itself replaced with
+`light_sleep_max` + `light_sleep_min_hours` (sleep-friendly-hour-count
+threshold — see the `incubator_settings` historical note above and the
+`incubator-light-average-alert`/`incubator-light-average-status` writeups
+for the full rationale):
+
+| Old field | New field |
+|---|---|
+| `light_avg_max` (24h rolling average threshold) | `light_sleep_max` + `light_sleep_min_hours` (sleep-friendly-hour-count threshold, checked hourly) |
+
+**Deploy-order/monitoring-gap warning:** the moment `incubator-light-average-
+alert` is redeployed with the new scan filter (requiring *both* new fields to
+exist), any device that hasn't re-saved its settings yet stops being checked
+for light at all — silently, no error, just no more light alerts for that
+device until it re-saves. A device actively relying on the old `light_avg_max`
+check goes dark on this specific check the instant this deploys. Recommended
+deploy order: `incubator-settings-get` → frontend → `incubator-settings-post`
+→ re-save settings on real devices → `incubator-light-average-alert`/
+`-status` last (same shape of warning as the `battery_percent_min` rollout,
+but worth restating since this one silently *disables* a check rather than
+just returning a stale default).
+
+**Naming note:** `incubator-light-average-alert`, `incubator-light-average-
+status`, their EventBridge rule (`incubator-light-average-hourly`), and the
+`/sensor/light-average` route all predate this change and are now partial
+misnomers ("average" no longer describes what's computed). Kept as-is
+deliberately — there's no IaC in this repo, so renaming any of these means
+manually recreating the Lambda (name is baked into its ARN) and rewiring its
+trigger/route/IAM role, for a purely cosmetic gain.
+
+`battery_percent_min` was added to `incubator_settings` (default 20).
+Existing rows written before this change will be missing it;
+`incubator-threshold-alert`'s `ThresholdChecker` simply skips the
+`battery_percent` check if the key isn't present (same graceful behavior as
+any other missing threshold field) until re-submitted via
+`incubator-settings-post` — at which point it becomes present, and mandatory
+on every subsequent POST (`NUMERIC_FIELDS` requires it). Deploy order
+matters: roll out `incubator-settings-get` and the frontend before making it
+required in `incubator-settings-post`, or existing open frontend sessions
+will get 400s on save.
+
 ---
 
 ## Test Events
@@ -772,6 +958,7 @@ in the Lambda console's "Test" tab:
 | `incubator-settings-get/test-event-existing-device.json` | incubator-settings-get | fetch a configured device |
 | `incubator-settings-get/test-event-unknown-device.json` | incubator-settings-get | fetch an unconfigured device → defaults |
 | `incubator-threshold-alert/test-event-violation.json` | incubator-threshold-alert | one field (temperature) out of range → one alert + SNS publish |
+| `incubator-threshold-alert/test-event-low-battery.json` | incubator-threshold-alert | low voltage → battery_percent below threshold → one alert + SNS publish |
 | `incubator-light-rollup/test-event-rollup.json` | incubator-light-rollup | one clean measurement → hourly bucket incremented |
 | `incubator-light-average-alert/test-event-scheduled.json` | incubator-light-average-alert | simulated hourly EventBridge tick |
 | `incubator-measurements-rejected-alert/test-event-scheduled.json` | incubator-measurements-rejected-alert | simulated hourly EventBridge tick |
@@ -784,3 +971,5 @@ in the Lambda console's "Test" tab:
 | `incubator-measurements-range/test-event-unknown-device.json` | incubator-measurements-range | device with no data → `[]` |
 | `incubator-battery-status/test-event-existing-device.json` | incubator-battery-status | fetch battery status for a device with recent readings |
 | `incubator-battery-status/test-event-unknown-device.json` | incubator-battery-status | fetch battery status for a device with no recent readings → `no_data` |
+| `incubator-light-average-status/test-event-existing-device.json` | incubator-light-average-status | fetch 24h light average for a device with recent hourly buckets |
+| `incubator-light-average-status/test-event-unknown-device.json` | incubator-light-average-status | fetch for a device with no buckets in the window → `no_data` |
